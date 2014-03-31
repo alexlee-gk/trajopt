@@ -2,22 +2,52 @@
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 #include <pcl/PolygonMesh.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/io/pcd_io.h>
+#include <boost/format.hpp>
+#include <boost/filesystem.hpp>
+#if PCL_MINOR_VERSION > 6
+#include <pcl/filters/median_filter.h>
+#include <pcl/filters/fast_bilateral.h>
+#endif
 #include <string>
 #include <Eigen/Core>
 #include "macros.h"
+
+#define FILE_OPEN_ERROR(fname) throw runtime_error( (boost::format("couldn't open %s")%fname).str() )
+
 namespace cloudproc {
 
 typedef Eigen::Matrix<bool, Eigen::Dynamic, 1> VectorXb;
 
 using pcl::PointCloud;
+using namespace std;
+using namespace pcl;
+namespace fs = boost::filesystem;
 
+template <class CloudT>
+void setWidthToSize(const CloudT& cloud) {
+  cloud->width = cloud->points.size();
+  cloud->height = 1;
+}
 
 /////// IO /////////
-template <typename T>
-TRAJOPT_API typename pcl::PointCloud<T>::Ptr readPCD(const std::string& pcdfile);
-
 template <class T>
-TRAJOPT_API void saveCloud(const pcl::PointCloud<T>& cloud, const std::string& pcdfile); // instantiate: pcl::PointXYZ pcl::PointXYZRGB pcl::PointNormal pcl::Normal
+TRAJOPT_API typename pcl::PointCloud<T>::Ptr readPCD(const std::string& pcdfile) {
+  pcl::PCLPointCloud2 cloud_blob;
+  typename pcl::PointCloud<T>::Ptr cloud (new typename pcl::PointCloud<T>);
+  if (pcl::io::loadPCDFile (pcdfile, cloud_blob) != 0) FILE_OPEN_ERROR(pcdfile);
+  pcl::fromPCLPointCloud2 (cloud_blob, *cloud);
+  return cloud;
+}
+
+template<class T>
+TRAJOPT_API void saveCloud(const typename pcl::PointCloud<T>& cloud, const std::string& fname) {
+  std::string ext = fs::extension(fname);
+  if (ext == ".pcd")   pcl::io::savePCDFileBinary(fname, cloud);
+  else if (ext == ".ply") PRINT_AND_THROW("not implemented");//pcl::io::savePLYFile(fname, cloud, true);
+  else throw std::runtime_error( (boost::format("%s has unrecognized extension")%fname).str() );
+}
 
 TRAJOPT_API void saveMesh(const pcl::PolygonMesh& mesh, const std::string& fname);
 
@@ -27,8 +57,15 @@ TRAJOPT_API pcl::PolygonMesh::Ptr loadMesh(const std::string& fname);
 
 
 /////// Misc processing /////////
-template <class T>
-TRAJOPT_API typename pcl::PointCloud<T>::Ptr downsampleCloud(typename pcl::PointCloud<T>::ConstPtr in, float vsize);
+  template<class T>
+  TRAJOPT_API typename pcl::PointCloud<T>::Ptr downsampleCloud(typename pcl::PointCloud<T>::ConstPtr in, float vsize) {
+    typename pcl::PointCloud<T>::Ptr out (new typename pcl::PointCloud<T>);
+    pcl::VoxelGrid< T > sor;
+    sor.setInputCloud (in);
+    sor.setLeafSize (vsize, vsize, vsize);
+    sor.filter (*out);
+    return out;
+  }
 
 TRAJOPT_API std::vector<int> getNearestNeighborIndices(pcl::PointCloud<pcl::PointXYZ>::Ptr src, pcl::PointCloud<pcl::PointXYZ>::Ptr targ);
 
@@ -45,8 +82,6 @@ TRAJOPT_API typename pcl::PointCloud<pcl::PointXYZ>::Ptr toXYZ(typename pcl::Poi
 
 /////// Smoothing /////
 
-template <class T>
-TRAJOPT_API typename pcl::PointCloud<T>::Ptr medianFilter(typename pcl::PointCloud<T>::ConstPtr in, int windowSize, float maxAllowedMovement); // instantiate: pcl::PointXYZ
 /**
 sigmaS: standard deviation of the Gaussian used by the bilateral filter for the spatial neighborhood/window. 
 PCL default: 15
@@ -54,7 +89,35 @@ sigmaR: standard deviation of the Gaussian used to control how much an adjacent 
 PCL default: .05
 */
 template <class T>
-TRAJOPT_API typename pcl::PointCloud<T>::Ptr fastBilateralFilter(typename pcl::PointCloud<T>::ConstPtr in, float sigmaS, float sigmaR); // instantiate: pcl::PointXYZ
+TRAJOPT_API typename pcl::PointCloud<T>::Ptr medianFilter(typename pcl::PointCloud<T>::ConstPtr in, int windowSize, float maxAllowedMovement) {
+#if PCL_MINOR_VERSION > 6
+  pcl::MedianFilter<T> mf;
+  mf.setWindowSize(windowSize);
+  mf.setMaxAllowedMovement(maxAllowedMovement);
+  typename PointCloud<T>::Ptr out(new PointCloud<T>());
+  mf.setInputCloud(in);
+  mf.filter(*out);
+  return out;
+#else 
+  PRINT_AND_THROW("not implemented");
+#endif
+}
+
+template <class T>
+TRAJOPT_API typename pcl::PointCloud<T>::Ptr fastBilateralFilter(typename pcl::PointCloud<T>::ConstPtr in, float sigmaS, float sigmaR) {
+#if PCL_MINOR_VERSION > 6
+  pcl::FastBilateralFilter<T> mf;
+  mf.setSigmaS(sigmaS);
+  mf.setSigmaR(sigmaR);
+  typename PointCloud<T>::Ptr out(new PointCloud<T>());
+  mf.setInputCloud(in);
+  mf.applyFilter(*out);
+  return out;
+#else
+  PRINT_AND_THROW("not implemented");
+#endif
+}
+
 
 
 /////// Meshing /////
@@ -78,18 +141,55 @@ TRAJOPT_API pcl::PolygonMesh::Ptr meshOFM(PointCloud<pcl::PointXYZ>::ConstPtr cl
 
 ////// Masking ////
 
+template <class T>
+typename pcl::PointCloud<T>::Ptr maskFilterDisorganized(typename pcl::PointCloud<T>::ConstPtr in, const VectorXb& mask) {
+  int n = mask.sum();
+  typename pcl::PointCloud<T>::Ptr out(new typename pcl::PointCloud<T>());
+  out->points.reserve(n);
+  for (int i=0; i < mask.size(); ++i) {
+    if (mask[i]) out->points.push_back(in->points[i]);
+  }
+  setWidthToSize(out);
+  return out;
+}
+
+template <class T>
+typename pcl::PointCloud<T>::Ptr maskFilterOrganized(typename pcl::PointCloud<T>::ConstPtr in, const VectorXb& mask) {
+  typename pcl::PointCloud<T>::Ptr out(new typename pcl::PointCloud<T>(*in));
+  for (int i=0; i < mask.size(); ++i) {
+    if (!mask[i]) {
+      T& pt = out->points[i];
+      pt.x = NAN;
+      pt.y = NAN;
+      pt.z = NAN;
+    }
+  }
+  return out;
+}
+
 /**
 if keep_organized == true, set points where mask=false to nan
 if keep_organized == false, return points where mask=true
 */
 template <class T>
-TRAJOPT_API typename pcl::PointCloud<T>::Ptr maskFilter(typename pcl::PointCloud<T>::ConstPtr in, const VectorXb& mask, bool keep_organized);
+TRAJOPT_API typename pcl::PointCloud<T>::Ptr maskFilter(typename pcl::PointCloud<T>::ConstPtr in, const VectorXb& mask, bool keep_organized) {
+  if (keep_organized) return maskFilterOrganized<T>(in, mask);
+  else return maskFilterDisorganized<T>(in, mask);
+}
 
 /**
 Return binary mask of points in axis aligned box
 */
 template <class T>
-TRAJOPT_API VectorXb boxMask(typename pcl::PointCloud<T>::ConstPtr, float xmin, float ymin, float zmin, float xmax, float ymax, float zmax);
+TRAJOPT_API VectorXb boxMask(typename pcl::PointCloud<T>::ConstPtr in, float xmin, float ymin, float zmin, float xmax, float ymax, float zmax) {
+  int i=0;
+  VectorXb out(in->size());
+  BOOST_FOREACH(const T& pt, in->points) {
+    out[i] = (pt.x >= xmin && pt.x <= xmax && pt.y >= ymin && pt.y <= ymax && pt.z >= zmin && pt.z <= zmax);
+    ++i;
+  }
+  return out;
+}
 
 /**
 Return points in box
